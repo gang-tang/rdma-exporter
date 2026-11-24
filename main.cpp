@@ -15,6 +15,10 @@
 #include <thread>
 #include <cstring>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <mutex>
+#include <set>
+#include <cerrno>
 #include "raw_rotating_logger.h"
 #include "rdma_qp_counters.h"
 
@@ -113,22 +117,16 @@ void printNow(std::string p)
     std::cout << p << us.count() << '\n';
 }
 
-std::vector<std::string> getInfinibandDevices()
+std::vector<fs::directory_entry> listCounterDirectory(const fs::path &path)
 {
-    const std::string infinibandPath = "/sys/class/infiniband";
-    std::vector<std::string> devices;
-    if (std::filesystem::exists(infinibandPath))
+    std::vector<fs::directory_entry> entries;
+    std::error_code error;
+    for (fs::directory_iterator entry(path, error), end;
+         !error && entry != end; entry.increment(error))
     {
-        for (const auto &entry : std::filesystem::directory_iterator(infinibandPath))
-        {
-            if (entry.is_directory())
-            {
-                std::string deviceName = entry.path().filename().string();
-                devices.push_back(deviceName);
-            }
-        }
+        entries.push_back(*entry);
     }
-    return devices;
+    return entries;
 }
 
 void exportInfinibandCounters()
@@ -137,9 +135,10 @@ void exportInfinibandCounters()
     char filename[256];
     char exportcontent[4096];
     const std::string infinibandPath = "/sys/class/infiniband";
-    for (const auto &entry : std::filesystem::directory_iterator(infinibandPath))
+    for (const auto &entry : listCounterDirectory(infinibandPath))
     {
-        if (entry.is_directory())
+        std::error_code error;
+        if (entry.is_directory(error))
         {
             std::string deviceName = entry.path().filename().string();
             sprintf(dirname, "/sys/class/infiniband/%s/ports/1/counters", deviceName.c_str());
@@ -147,9 +146,9 @@ void exportInfinibandCounters()
             int num = 0;
             // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
             offset += sprintf(exportcontent + offset, "ib_native_counters,ib_device=%s", deviceName.c_str());
-            for (const auto &centry : std::filesystem::directory_iterator(dirname))
+            for (const auto &centry : listCounterDirectory(dirname))
             {
-                if (centry.is_regular_file())
+                if (centry.is_regular_file(error))
                 {
                     std::string counterName = centry.path().filename().string();
                     sprintf(filename, "/sys/class/infiniband/%s/ports/1/counters/%s", deviceName.c_str(), counterName.c_str());
@@ -180,9 +179,9 @@ void exportInfinibandCounters()
             num = 0;
             // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
             offset += sprintf(exportcontent + offset, "ib_native_hwcounters,ib_device=%s", deviceName.c_str());
-            for (const auto &centry : std::filesystem::directory_iterator(dirname))
+            for (const auto &centry : listCounterDirectory(dirname))
             {
-                if (centry.is_regular_file())
+                if (centry.is_regular_file(error))
                 {
                     std::string counterName = centry.path().filename().string();
                     sprintf(filename, "/sys/class/infiniband/%s/ports/1/hw_counters/%s", deviceName.c_str(), counterName.c_str());
@@ -209,18 +208,18 @@ void exportInfinibandCounters()
             }
 
             fs::path netPath = entry.path() / "device/net";
-            if (fs::exists(netPath) && fs::is_directory(netPath))
+            if (fs::is_directory(netPath, error))
             {
-                for (const auto &netEntry : fs::directory_iterator(netPath))
+                for (const auto &netEntry : listCounterDirectory(netPath))
                 {
-                    if (!netEntry.is_directory())
+                    if (!netEntry.is_directory(error))
                     {
                         continue;
                     }
 
                     std::string netDeviceName = netEntry.path().filename().string();
                     fs::path carrierPath = netEntry.path() / "carrier";
-                    if (!fs::exists(carrierPath))
+                    if (!fs::exists(carrierPath, error))
                     {
                         continue;
                     }
@@ -248,7 +247,19 @@ void exportInfinibandCounters()
     }
 }
 
-void CalculateRate(const char *port_name)
+struct RateWorker
+{
+    RateWorker(int fd, std::string name) : directory_fd(fd), device_name(std::move(name)) {}
+
+    const int directory_fd;
+    std::mutex mutex;
+    std::string device_name; // Empty when discovery asks the worker to stop.
+    std::thread thread;
+    bool seen = false;
+    unsigned missed_scans = 0;
+};
+
+void CalculateRate(RateWorker &worker)
 {
     char tx_path[256];
     char rx_path[256];
@@ -289,26 +300,94 @@ void CalculateRate(const char *port_name)
         agg_start_us = -1;
     };
 
-    if (port_name == NULL)
+    std::string device_name;
     {
-        return;
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        device_name = worker.device_name;
     }
+    const char *port_name = device_name.c_str();
     printf("start monitoring %s\n", port_name);
-    sprintf(tx_path, "/sys/class/infiniband/%s/ports/1/counters/port_xmit_data", port_name);
-    sprintf(rx_path, "/sys/class/infiniband/%s/ports/1/counters/port_rcv_data", port_name);
+    // Keep reads tied to this device even if its old name is reused.
+    sprintf(tx_path, "/proc/self/fd/%d/ports/1/counters/port_xmit_data", worker.directory_fd);
+    sprintf(rx_path, "/proc/self/fd/%d/ports/1/counters/port_rcv_data", worker.directory_fd);
     last_check_time = std::chrono::high_resolution_clock::now();
-    if (strncmp(port_name, "mlx5_", strlen("mlx5_")) == 0) {
-        char rate_path[256];
-        uint64_t rate;
-        sprintf(rate_path, "/sys/class/infiniband/%s/ports/1/rate", port_name);
-        rate = readUint64FromFile(rate_path);
-        if (rate > 0) {
-            max_port_rate = rate;
+    char rate_path[256];
+    sprintf(rate_path, "/proc/self/fd/%d/ports/1/rate", worker.directory_fd);
+    const auto rate = readUint64FromFile(rate_path);
+    if (rate > 0)
+        max_port_rate = rate;
+    auto process_samples = [&]()
+    {
+        for (int i = 0; i < next_index; i++)
+        {
+            auto rx_rate = port_rates[i].rx_rate;
+            auto tx_rate = port_rates[i].tx_rate;
+            if (agg_count > 0)
+            {
+                auto rx_agg_new = (rx_agg + rx_rate) / (agg_count + 1);
+                auto tx_agg_new = (tx_agg + tx_rate) / (agg_count + 1);
+                if (rx_rate > rx_agg_new * (1 + MAX_DEVIATION) ||
+                    rx_rate < rx_agg_new * (1 - MAX_DEVIATION) ||
+                    tx_rate > tx_agg_new * (1 + MAX_DEVIATION) ||
+                    tx_rate < tx_agg_new * (1 - MAX_DEVIATION))
+                {
+                    // printf("ts:%ld rx_rate:%f tx_rate:%f\n", agg_last_us/1000, rx_agg / agg_count, tx_agg / agg_count);
+                    // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
+                    export_rates(port_name, rx_agg / agg_count, tx_agg / agg_count, agg_last_us);
+                    export_rates(port_name, rx_rate, tx_rate, port_rates[i].ts_us);
+                    continue;
+                }
+            }
+            else if (agg_count == 0 && last_export_us != 0)
+            {
+                if (rx_rate > last_export_rx_rate * (1 + MAX_DEVIATION) ||
+                    rx_rate < last_export_rx_rate * (1 - MAX_DEVIATION) ||
+                    tx_rate > last_export_tx_rate * (1 + MAX_DEVIATION) ||
+                    tx_rate < last_export_tx_rate * (1 - MAX_DEVIATION))
+                {
+                    export_rates(port_name, rx_rate, tx_rate, port_rates[i].ts_us);
+                    continue;
+                }
+            }
+            agg_count += 1;
+            rx_agg += rx_rate;
+            tx_agg += tx_rate;
+            agg_last_us = port_rates[i].ts_us;
+            if (agg_count == 1)
+            {
+                agg_start_us = agg_last_us;
+            }
+            if (agg_last_us - agg_start_us >= MAX_AGG_DUR_US)
+            {
+                // printf("last_ts:%ld, start_ts:%ld\n", agg_last_us, agg_start_us);
+                // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
+                export_rates(port_name, rx_agg / agg_count, tx_agg / agg_count, agg_last_us);
+            }
         }
-    }
+        next_index = 0;
+    };
+
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::microseconds(HIGH_RES_US));
+        std::string current_name;
+        {
+            std::lock_guard<std::mutex> lock(worker.mutex);
+            current_name = worker.device_name;
+        }
+        if (current_name != device_name || current_name.empty())
+        {
+            process_samples();
+            if (agg_count > 0)
+                export_rates(port_name, rx_agg / agg_count, tx_agg / agg_count, agg_last_us);
+            if (current_name.empty())
+                return;
+
+            device_name = std::move(current_name);
+            port_name = device_name.c_str();
+            last_export_us = 0;
+            last_check_time = std::chrono::high_resolution_clock::now();
+        }
         tx_bytes = 4 * readUint64FromFile(tx_path); // word to bytes
         if (tx_bytes == 0)
         {
@@ -380,55 +459,80 @@ void CalculateRate(const char *port_name)
         auto dur_sec = std::chrono::duration_cast<std::chrono::seconds>(check_time - last_check_time).count();
         if (next_index == MAX_RECORDS || dur_sec >= MAX_STAGING_SEC)
         {
-            for (int i = 0; i < next_index; i++)
-            {
-                auto rx_rate = port_rates[i].rx_rate;
-                auto tx_rate = port_rates[i].tx_rate;
-                if (agg_count > 0)
-                {
-                    auto rx_agg_new = (rx_agg + rx_rate) / (agg_count + 1);
-                    auto tx_agg_new = (tx_agg + tx_rate) / (agg_count + 1);
-                    if (rx_rate > rx_agg_new * (1 + MAX_DEVIATION) ||
-                        rx_rate < rx_agg_new * (1 - MAX_DEVIATION) ||
-                        tx_rate > tx_agg_new * (1 + MAX_DEVIATION) ||
-                        tx_rate < tx_agg_new * (1 - MAX_DEVIATION))
-                    {
-                        // printf("ts:%ld rx_rate:%f tx_rate:%f\n", agg_last_us/1000, rx_agg / agg_count, tx_agg / agg_count);
-                        // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
-                        export_rates(port_name, rx_agg / agg_count, tx_agg / agg_count, agg_last_us);
-                        export_rates(port_name, rx_rate, tx_rate, port_rates[i].ts_us);
-                        continue;
-                    }
-                }
-                else if (agg_count == 0 && last_export_us != 0)
-                {
-                    if (rx_rate > last_export_rx_rate * (1 + MAX_DEVIATION) ||
-                        rx_rate < last_export_rx_rate * (1 - MAX_DEVIATION) ||
-                        tx_rate > last_export_tx_rate * (1 + MAX_DEVIATION) ||
-                        tx_rate < last_export_tx_rate * (1 - MAX_DEVIATION))
-                    {
-                        export_rates(port_name, rx_rate, tx_rate, port_rates[i].ts_us);
-                        continue;
-                    }
-                }
-                agg_count += 1;
-                rx_agg += rx_rate;
-                tx_agg += tx_rate;
-                agg_last_us = port_rates[i].ts_us;
-                if (agg_count == 1)
-                {
-                    agg_start_us = agg_last_us;
-                }
-                if (agg_last_us - agg_start_us >= MAX_AGG_DUR_US)
-                {
-                    // printf("last_ts:%ld, start_ts:%ld\n", agg_last_us, agg_start_us);
-                    // ib_counters,ib_device=mlx5_1:1 rx_rate=0.02,tx_rate=23.30 1762504959175000000
-                    export_rates(port_name, rx_agg / agg_count, tx_agg / agg_count, agg_last_us);
-                }
-            }
+            process_samples();
             last_check_time = check_time;
-            next_index = 0;
         }
+    }
+}
+
+void MonitorRateDevices(const fs::path &path)
+{
+    // Hold the directory open while its sysfs identity is in use.
+    std::map<std::pair<dev_t, ino_t>, RateWorker> workers;
+    while (true)
+    {
+        std::set<std::string> unresolved_names;
+        std::error_code error;
+        for (fs::directory_iterator entry(path, error), end;
+             !error && entry != end; entry.increment(error))
+        {
+            const auto name = entry->path().filename().string();
+            const int fd = open(entry->path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (fd < 0)
+            {
+                if (errno != ENOENT && errno != ENOTDIR)
+                    unresolved_names.insert(name);
+                continue;
+            }
+
+            struct stat info;
+            if (fstat(fd, &info) < 0)
+            {
+                close(fd);
+                unresolved_names.insert(name);
+                continue;
+            }
+
+            auto [position, added] = workers.try_emplace({info.st_dev, info.st_ino}, fd, name);
+            auto &worker = position->second;
+            if (added)
+                worker.thread = std::thread(CalculateRate, std::ref(worker));
+            else
+            {
+                close(fd);
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                worker.device_name = name;
+            }
+            worker.seen = true;
+        }
+
+        const bool complete = !error || error == std::errc::no_such_file_or_directory;
+        for (auto position = workers.begin(); position != workers.end();)
+        {
+            auto &worker = position->second;
+            bool retire = false;
+            {
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                if (worker.seen || !complete || unresolved_names.count(worker.device_name) != 0)
+                    worker.missed_scans = 0;
+                // Tolerate one scan that misses a device during a rename.
+                else if (++worker.missed_scans == 2)
+                {
+                    worker.device_name.clear();
+                    retire = true;
+                }
+                worker.seen = false;
+            }
+            if (retire)
+            {
+                worker.thread.join();
+                close(worker.directory_fd);
+                position = workers.erase(position);
+            }
+            else
+                ++position;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -444,8 +548,6 @@ void MetricExporter()
 
 int main(int argc, char **argv)
 {
-    std::vector<std::thread> threads;
-
     int fd = open(LOCK_PATH, O_RDWR | O_CREAT, 0666);
     if (fd == -1)
     {
@@ -460,16 +562,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    auto devices = getInfinibandDevices();
-    for (const auto &device : devices)
-    {
-        threads.push_back(std::thread(CalculateRate, device.c_str()));
-    }
-    
-    threads.push_back(std::thread(MetricExporter));
-    for (auto &t : threads)
-    {
-        t.join();
-    }
+    std::thread metric_thread(MetricExporter);
+    MonitorRateDevices("/sys/class/infiniband");
+    metric_thread.join();
     return 0;
 }
